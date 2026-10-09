@@ -8,14 +8,15 @@
   :root { box-sizing: border-box; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
   html { scroll-padding-top: env(safe-area-inset-top, 0px); }
   html, body { height: 100%; margin: 0; background: #12040f; overflow: hidden; }
-  canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
+  html, body { overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
+  canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: block; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 </style>
 </head>
 <body>
 <canvas id="c" aria-label="A heart made of the words I love you in 72 languages, surrounded by lilies"></canvas>
 <script>
 (function () {
-  var W = 800, CY = 370;
+  var W = 800, CY = 370, HH = 800, K = W * 0.9 / 34;
   var FONT = '"Segoe UI","Noto Sans","Helvetica Neue",Arial,"Noto Sans CJK JP","Noto Sans Devanagari","Noto Sans Thai","Noto Sans Arabic","Noto Sans Hebrew","Noto Sans Bengali","Noto Sans Tamil","Noto Sans Telugu","Noto Sans Georgian","Noto Sans Armenian","Malgun Gothic","Microsoft YaHei",sans-serif';
   // 72 languages. Index 0 is English.
   var PHRASES = [
@@ -37,34 +38,30 @@
   var seed = 11;
   function rnd() { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }
 
-  // heart outline polygon (logical 800 x 800 space)
-  var K = W * 0.9 / 34, poly = [];
-  for (var i = 0; i < 360; i++) {
-    var a = i / 360 * Math.PI * 2;
-    var X = 16 * Math.pow(Math.sin(a), 3);
-    var Y = 13 * Math.cos(a) - 5 * Math.cos(2 * a) - 2 * Math.cos(3 * a) - Math.cos(4 * a);
-    poly.push([W / 2 + X * K, CY - (Y + 2.5) * K]);
-  }
-  var MASK = new Uint8Array(W * W);
-  (function () {
-    for (var y = 0; y < W; y++) {
-      var xs = [], yy = y + 0.5;
-      for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        var yi = poly[i][1], yj = poly[j][1];
-        if ((yi > yy) !== (yj > yy)) xs.push((poly[j][0] - poly[i][0]) * (yy - yi) / (yj - yi) + poly[i][0]);
-      }
-      xs.sort(function (p, q) { return p - q; });
-      for (var k = 0; k + 1 < xs.length; k += 2)
-        for (var x = Math.max(0, Math.ceil(xs[k] - 0.5)); x <= Math.min(W - 1, Math.floor(xs[k + 1] - 0.5)); x++) MASK[y * W + x] = 1;
+  // layout state (rebuilt whenever the screen type changes, e.g. phone upright vs sideways)
+  var poly, MASK, wcache, items, blocks, fillIdx, grid, GN = 32, GR = 32, G = 25;
+  var order, hero, doneAt, M = 1, MB = 1, MG = 1, SY = 1, layoutKey = "";
+  var deck, pend, pendFails, placed, prePlaced = {};
+
+  // screen -> layout settings. Desktop: exactly as before. Phone: taller heart + bigger words so everything is readable.
+  function settings() {
+    var vw_ = window.innerWidth, vh_ = window.innerHeight;
+    var mobile = Math.min(vw_, vh_) < 600, portrait = vw_ < vh_;
+    var s = Math.min(vw_ / (portrait ? 740 : 840), vh_ / 760);
+    var m = 1, sy = 1;
+    if (mobile) {
+      m = Math.max(1, (portrait ? 1.25 : 1.1) / s);                 // smallest word is about 7px on screen
+      if (portrait) sy = Math.max(1, Math.min(1.5, vh_ * 0.6 / (614 * s)));   // use the tall screen: stretch the heart upward
     }
-  })();
+    return { S: s, M: Math.round(Math.min(3, m) * 10) / 10, SY: Math.round(sy * 10) / 10 };
+  }
+
   function inside(x, y) {
     var ix = Math.round(x), iy = Math.round(y);
-    return ix >= 0 && iy >= 0 && ix < W && iy < W && MASK[iy * W + ix] === 1;
+    return ix >= 0 && iy >= 0 && ix < W && iy < HH && MASK[iy * W + ix] === 1;
   }
-  var wcache = {};
   function tw(pi, size) {
-    var key = pi * 100 + size;
+    var key = pi * 1000 + size;
     if (wcache[key] === undefined) { ctx.font = "bold " + size + "px " + FONT; wcache[key] = ctx.measureText(PHRASES[pi]).width; }
     return wcache[key];
   }
@@ -73,23 +70,30 @@
     for (var i = 0; i < poly.length; i++) { var d = Math.hypot(poly[i][0] - x, poly[i][1] - y); if (d < m) m = d; }
     return m;
   }
-
+  function occupy(o) {
+    var c0 = Math.max(0, Math.floor((o.x - o.hw) / G)), c1 = Math.min(GN - 1, Math.floor((o.x + o.hw) / G));
+    var r0 = Math.max(0, Math.floor((o.y - o.hh) / G)), r1 = Math.min(GR - 1, Math.floor((o.y + o.hh) / G));
+    for (var r = r0; r <= r1; r++) for (var c = c0; c <= c1; c++) (grid[r * GN + c] = grid[r * GN + c] || []).push(o);
+  }
+  function colorFor(pi, y) {
+    var f = Math.min(1, Math.max(0, (y - (CY - 307 * SY)) / (614 * SY)));
+    return pi === 0 ? "hsl(335,100%,94%)" : "hsl(" + (328 + f * 22 + (rnd() - 0.5) * 8) + ",85%," + Math.round(68 + rnd() * 14) + "%)";
+  }
   // place one phrase if it fits inside the heart without touching the others
-  var items = [];
   function tryPlace(pi, size, x, y, tight) {
     var hw = tw(pi, size) / 2, hh = size * 1.15 / 2;
-    // the middle of the word must sit inside the heart; the top and bottom corners may overhang the edge a little,
-    // which makes the outline a complete heart instead of a ragged stair-step
-    var ih = Math.max(1, hw - 1), iv = Math.max(0, hh - 4);
+    // the middle of the word must sit inside the heart; the top and bottom corners may overhang the edge a little
+    var ih = Math.max(1, hw - 1), iv = Math.max(0, hh - 4 * MG);
     var pts = [[-ih,-iv],[ih,-iv],[-ih,iv],[ih,iv],[-ih,0],[ih,0],[0,0]];
     for (var p = 0; p < pts.length; p++) if (!inside(x + pts[p][0], y + pts[p][1])) return null;
-    var c0 = Math.max(0, Math.floor((x - hw - 6) / G)), c1 = Math.min(GN - 1, Math.floor((x + hw + 6) / G));
-    var r0 = Math.max(0, Math.floor((y - hh - 6) / G)), r1 = Math.min(GN - 1, Math.floor((y + hh + 6) / G));
+    var pad = 6 * MG;
+    var c0 = Math.max(0, Math.floor((x - hw - pad) / G)), c1 = Math.min(GN - 1, Math.floor((x + hw + pad) / G));
+    var r0 = Math.max(0, Math.floor((y - hh - pad) / G)), r1 = Math.min(GR - 1, Math.floor((y + hh + pad) / G));
     for (var gy2 = r0; gy2 <= r1; gy2++) for (var gx2 = c0; gx2 <= c1; gx2++) {
       var cell = grid[gy2 * GN + gx2];
       if (!cell) continue;
       for (var q = 0; q < cell.length; q++) {
-        var o = cell[q], mx = o.b ? (tight ? 0 : 2) : (tight ? 1 : 3), my = o.b ? mx : (tight ? 1 : 2);
+        var o = cell[q], mx = (o.b ? (tight ? 0 : 2) : (tight ? 1 : 3)) * MG, my = (o.b ? (tight ? 0 : 2) : (tight ? 1 : 2)) * MG;
         if (Math.abs(x - o.x) < hw + o.hw + mx && Math.abs(y - o.y) < hh + o.hh + my) return null;
       }
     }
@@ -98,100 +102,161 @@
     items.push(it); occupy({ x: x, y: y, hw: hw, hh: hh, b: false });
     return it;
   }
-  function colorFor(pi, y) {
-    var f = Math.min(1, Math.max(0, (y - 63) / 614));
-    return pi === 0 ? "hsl(335,100%,94%)" : "hsl(" + (328 + f * 22 + (rnd() - 0.5) * 8) + ",85%," + Math.round(68 + rnd() * 14) + "%)";
-  }
-  var blocks = [], fillIdx = [];
-  var G = 25, GN = 32, grid = [];
-  function occupy(o) {
-    var c0 = Math.max(0, Math.floor((o.x - o.hw) / G)), c1 = Math.min(GN - 1, Math.floor((o.x + o.hw) / G));
-    var r0 = Math.max(0, Math.floor((o.y - o.hh) / G)), r1 = Math.min(GN - 1, Math.floor((o.y + o.hh) / G));
-    for (var r = r0; r <= r1; r++) for (var c = c0; c <= c1; c++) (grid[r * GN + c] = grid[r * GN + c] || []).push(o);
-  }
-  PHRASES.forEach(function (p, i) { if (i > 0 && Array.from(p).length <= 13) fillIdx.push(i); });
-
-
-  // 1) the big English "I love you" in the middle (the only English one)
-  var hero = null, spots = [[400,310],[400,330],[400,290],[400,350]];
-  for (var s = 0; s < spots.length && !hero; s++) hero = tryPlace(0, 54, spots[s][0], spots[s][1]);
-  if (hero) { hero.hero = true; }
-
-  // 2) fill the heart row by row (like lines of text), cycling a shuffled deck so every language appears
-  var deck = [], pend = null, pendFails = 0, placed = { 0: true };
   function refill() {
     deck = [];
-    for (var i = 1; i < PHRASES.length; i++) deck.push(i);
+    for (var i = 1; i < PHRASES.length; i++) if (!prePlaced[i]) deck.push(i);
+    if (!deck.length) for (var i3 = 1; i3 < PHRASES.length; i3++) deck.push(i3);
     for (var j = deck.length - 1; j > 0; j--) { var k = Math.floor(rnd() * (j + 1)), tmp = deck[j]; deck[j] = deck[k]; deck[k] = tmp; }
   }
-  for (var yc = 72; yc < 690; yc += 22) {
-    var cx = 56, guard = 0;
-    while (cx < 744 && guard++ < 500) {
-      if (!inside(cx + 4, yc)) { cx += 6; continue; }
-      if (pend === null) { if (!deck.length) refill(); pend = deck.pop(); pendFails = 0; }
-      var chars = Array.from(PHRASES[pend]).length;
-      var cap = Math.max(9, Math.min(20, 130 / (chars * 0.56)));              // long phrases get smaller type
-      var want = Math.min(Math.round(cap), 10 + Math.floor(rnd() * 8)), got = null;
-      for (var sz = want; sz >= 9 && !got; sz--) {
-        var ww = tw(pend, sz);
-        got = tryPlace(pend, sz, cx + ww / 2, yc + (rnd() - 0.5) * 6);
-        if (got) cx += ww + 7 + rnd() * 9;
-      }
-      if (got) { placed[pend] = true; pend = null; }
-      else { cx += 6; if (++pendFails > 25) { deck.unshift(pend); pend = null; } }
-    }
-  }
-  // 3) squeeze in any language that is still missing: scan the heart for the first gap it fits
-  for (var m = 1; m < PHRASES.length; m++) {
-    if (placed[m]) continue;
-    for (var sz2 = 11; sz2 >= 6 && !placed[m]; sz2--) {
-      for (var gy = 62; gy < 692 && !placed[m]; gy += 3) {
-        for (var gx = 56; gx < 744; gx += 4) {
-          var gw = tw(m, sz2);
-          if (tryPlace(m, sz2, gx + gw / 2, gy)) { placed[m] = true; break; }
+  var yTop = 0, yBot = 0, RF = 1;
+  function R(n) { return Math.max(1, Math.round(n * M)); }                            // small words: scaled so they stay readable
+  function RB(n) { return Math.max(R(7), Math.round(n * MB * RF)); }                  // big words (RF shrinks them until every language fits)
+
+  // steps 1-3: the big English line, then every language gets a seat. Returns how many languages found a seat.
+  function seat(f) {
+    RF = f; seed = 11; items = []; grid = [];
+    var RS = (M > 1.05 ? 20 : 22) * MB * f;                                           // row height
+
+    // 1) the big English "I love you" in the middle (the only English one)
+    hero = null;
+    var spots = [[400, CY - 60 * SY], [400, CY - 40 * SY], [400, CY - 80 * SY], [400, CY - 20 * SY]];
+    for (var hs = Math.round(54 * Math.max(1, M * 0.5)); hs >= 54 && !hero; hs -= 4)
+      for (var s = 0; s < spots.length && !hero; s++) hero = tryPlace(0, hs, spots[s][0], spots[s][1]);
+    if (hero) hero.hero = true;
+
+    // phones: seat the longest phrases first (on the same rows as the text), so every language still gets a spot
+    placed = { 0: true }; prePlaced = {};
+    if (M > 1.05) {
+      var wide = [], nRows = Math.floor((yBot - 4 * SY - (yTop + 10 * MB * f)) / RS);
+      for (var wi = 1; wi < PHRASES.length; wi++) wide.push([tw(wi, RB(10)), wi]);
+      wide.sort(function (a, b) { return b[0] - a[0]; });
+      for (var wj = 0; wj < 24; wj++) {
+        var wp = wide[wj][1], ok = false;
+        for (var wsz = RB(10); wsz >= R(7) && !ok; wsz--) {
+          for (var wt = 0; wt < 300 && !ok; wt++) {
+            var wy = yTop + 10 * MB * f + Math.floor(rnd() * nRows) * RS;
+            if (tryPlace(wp, wsz, 60 + rnd() * 680, wy)) { ok = true; placed[wp] = true; prePlaced[wp] = true; }
+          }
         }
       }
     }
-  }
 
-  // 4) fill every remaining gap, especially along the edges, with small short words
-  var fc = 0;
-  for (var fy = 62; fy < 694; fy += 3) {
-    for (var fx = 50; fx < 750; fx += 3) {
-      if (!inside(fx + 2, fy)) continue;
-      var done = false;
-      for (var fs = 14; fs >= 8 && !done; fs--) {
-        for (var tr = 0; tr < 4 && !done; tr++) {
-          var pj = fillIdx[(fc + tr) % fillIdx.length], fw = tw(pj, fs);
-          if (tryPlace(pj, fs, fx + fw / 2, fy)) { done = true; fc += tr + 1; fx += fw; }
+    // 2) fill the heart row by row (like lines of text), cycling a shuffled deck so every language appears
+    deck = []; pend = null; pendFails = 0;
+    for (var yc = yTop + 10 * MB * f; yc < yBot - 4 * SY; yc += RS) {
+      var cx = 56, guard = 0;
+      while (cx < 744 && guard++ < 500) {
+        if (!inside(cx + 4, yc)) { cx += 6; continue; }
+        if (pend === null) { if (!deck.length) refill(); pend = deck.pop(); pendFails = 0; }
+        var chars = Array.from(PHRASES[pend]).length;
+        var cap = Math.max(9, Math.min(20, 130 / (chars * 0.56)));            // long phrases get smaller type
+        var want = Math.min(Math.round(cap), 10 + Math.floor(rnd() * 8)), got = null;
+        for (var sz = want; sz >= 9 && !got; sz--) {
+          var fs0 = RB(sz), ww = tw(pend, fs0);
+          got = tryPlace(pend, fs0, cx + ww / 2, yc + (rnd() - 0.5) * 6 * MB * f);
+          if (got) cx += ww + (7 + rnd() * 9) * MG;
+        }
+        if (got) { placed[pend] = true; pend = null; }
+        else { cx += 6; if (++pendFails > 25) { deck.unshift(pend); pend = null; } }
+      }
+    }
+    // 3) squeeze in any language that is still missing: scan the heart for the first gap it fits
+    for (var m = 1; m < PHRASES.length; m++) {
+      if (placed[m]) continue;
+      for (var sz2 = R(11); sz2 >= R(6) && !placed[m]; sz2--) {
+        for (var gy = yTop; gy < yBot - 2 && !placed[m]; gy += 3 * M) {
+          for (var gx = 56; gx < 744; gx += 4 * M) {
+            var gw = tw(m, sz2);
+            if (tryPlace(m, sz2, gx + gw / 2, gy)) { placed[m] = true; break; }
+          }
         }
       }
     }
+    return Object.keys(placed).length;
   }
 
-  // 5) last pass: tuck tiny words into every leftover nook so the outline is crisp all the way round
-  for (var ty = 62; ty < 694; ty += 2) {
-    for (var tx = 50; tx < 750; tx += 2) {
-      if (!inside(tx + 1, ty)) continue;
-      var done2 = false;
-      for (var ts = 10; ts >= 6 && !done2; ts--) {
-        for (var tr2 = 0; tr2 < 6 && !done2; tr2++) {
-          var pk = fillIdx[(fc + tr2) % fillIdx.length], tww = tw(pk, ts);
-          if (tryPlace(pk, ts, tx + tww / 2, ty, true)) { done2 = true; fc += tr2 + 1; tx += tww; }
+  function setScale(m) {
+    M = m;
+    MB = 1 + (M - 1) * 0.55;   // big words grow less than the smallest words, so the heart shape stays crisp
+    MG = 1 + (M - 1) * 0.3;    // gaps between words
+  }
+
+  function build(cfg) {
+    setScale(cfg.M); SY = cfg.SY;
+    CY = Math.round(307 * SY + 63); HH = Math.ceil(CY + 307 * SY + 123);
+    GR = Math.ceil(HH / G);
+    wcache = {}; items = []; grid = []; fillIdx = [];
+
+    // heart outline polygon (logical space, W wide)
+    poly = [];
+    for (var i = 0; i < 360; i++) {
+      var a = i / 360 * Math.PI * 2;
+      var X = 16 * Math.pow(Math.sin(a), 3);
+      var Y = 13 * Math.cos(a) - 5 * Math.cos(2 * a) - 2 * Math.cos(3 * a) - Math.cos(4 * a);
+      poly.push([W / 2 + X * K, CY - (Y + 2.5) * K * SY]);
+    }
+    MASK = new Uint8Array(W * HH);
+    for (var y = 0; y < HH; y++) {
+      var xs = [], yy = y + 0.5;
+      for (var i2 = 0, j2 = poly.length - 1; i2 < poly.length; j2 = i2++) {
+        var yi = poly[i2][1], yj = poly[j2][1];
+        if ((yi > yy) !== (yj > yy)) xs.push((poly[j2][0] - poly[i2][0]) * (yy - yi) / (yj - yi) + poly[i2][0]);
+      }
+      xs.sort(function (p, q) { return p - q; });
+      for (var k = 0; k + 1 < xs.length; k += 2)
+        for (var x = Math.max(0, Math.ceil(xs[k] - 0.5)); x <= Math.min(W - 1, Math.floor(xs[k + 1] - 0.5)); x++) MASK[y * W + x] = 1;
+    }
+    PHRASES.forEach(function (p, i) { if (i > 0 && Array.from(p).length <= 13) fillIdx.push(i); });
+    yTop = CY - 308 * SY; yBot = CY + 324 * SY;
+
+    // seat every language; on phones, shrink the big words step by step until all of them fit
+    var f = 1, relax = 0;
+    for (;;) {
+      seat(f);
+      if (M <= 1.05 || Object.keys(placed).length >= PHRASES.length) break;
+      if (f > 0.5) { f = Math.round((f - 0.06) * 100) / 100; continue; }
+      if (M > 1.5 && relax++ < 4) { setScale(Math.round((M - 0.2) * 10) / 10); f = 1; continue; }   // very small screen: allow slightly smaller type
+      break;
+    }
+
+    // 4) fill every remaining gap, especially along the edges, with small short words
+    var fc = 0, top4 = M > 1.05 ? Math.min(R(14), RB(12)) : 14, top5 = M > 1.05 ? Math.min(R(10), RB(9)) : 10;
+    for (var fy = yTop; fy < yBot; fy += 3 * M) {
+      for (var fx = 50; fx < 750; fx += 3 * M) {
+        if (!inside(fx + 2, fy)) continue;
+        var done = false;
+        for (var fs = top4; fs >= R(8) && !done; fs--) {
+          for (var tr = 0; tr < 4 && !done; tr++) {
+            var pj = fillIdx[(fc + tr) % fillIdx.length], fw = tw(pj, fs);
+            if (tryPlace(pj, fs, fx + fw / 2, fy)) { done = true; fc += tr + 1; fx += fw; }
+          }
         }
       }
     }
-  }
+    // 5) last pass: tuck tiny words into every leftover nook so the outline is crisp all the way round
+    for (var ty = yTop; ty < yBot; ty += 2 * M) {
+      for (var tx = 50; tx < 750; tx += 2 * M) {
+        if (!inside(tx + 1, ty)) continue;
+        var done2 = false;
+        for (var ts = top5; ts >= R(6) && !done2; ts--) {
+          for (var tr2 = 0; tr2 < 6 && !done2; tr2++) {
+            var pk = fillIdx[(fc + tr2) % fillIdx.length], tww = tw(pk, ts);
+            if (tryPlace(pk, ts, tx + tww / 2, ty, true)) { done2 = true; fc += tr2 + 1; tx += tww; }
+          }
+        }
+      }
+    }
 
-  // reveal order: outline first, then the inside, then the big English line last
-  var rest = items.filter(function (it) { return !it.hero; });
-  var outline = rest.filter(function (it) { return it.edge < 30; }).sort(function (a, b) { return a.ang - b.ang; });
-  var inner = rest.filter(function (it) { return it.edge >= 30; }).sort(function () { return rnd() - 0.5; });
-  var order = outline.concat(inner);
-  var tt = 1200;
-  order.forEach(function (it, i) { it.delay = tt; tt += i < outline.length ? 45 : 20; });
-  if (hero) { hero.delay = tt + 250; hero.fade = 1400; order.push(hero); tt += 250 + 1400; }
-  var doneAt = tt + 450;
+    // reveal order: outline first, then the inside, then the big English line last
+    var rest = items.filter(function (it) { return !it.hero; });
+    var outline = rest.filter(function (it) { return it.edge < 30 * MB; }).sort(function (a, b) { return a.ang - b.ang; });
+    var inner = rest.filter(function (it) { return it.edge >= 30 * MB; }).sort(function () { return rnd() - 0.5; });
+    order = outline.concat(inner);
+    var tt = 1200;
+    order.forEach(function (it, i) { it.delay = tt; tt += i < outline.length ? 45 : 20; });
+    if (hero) { hero.delay = tt + 250; hero.fade = 1400; order.push(hero); tt += 250 + 1400; }
+    doneAt = tt + 450;
+  }
 
   // ---------- lilies ----------
   var PAL = [
@@ -255,7 +320,13 @@
   function resize() {
     vw = window.innerWidth; vh = window.innerHeight;
     cv.width = Math.round(vw * dpr); cv.height = Math.round(vh * dpr);
-    S = Math.min(vw / 840, vh / 760);
+    var cfg = settings(); S = cfg.S;
+    var key = cfg.M + "_" + cfg.SY;
+    if (key !== layoutKey) {                                   // screen type changed (or first run): lay the words out again
+      var wasDone = layoutKey !== "" && (performance.now() - start) > doneAt;
+      build(cfg); layoutKey = key; bursts = []; flash = null;
+      if (wasDone) start = performance.now() - doneAt - 1;      // keep a finished heart finished
+    }
     bg = ctx.createRadialGradient(vw / 2, vh / 2, 40, vw / 2, vh / 2, Math.max(vw, vh) * 0.75);
     bg.addColorStop(0, "#2b0a22"); bg.addColorStop(0.55, "#12040f"); bg.addColorStop(1, "#000");
     var n = Math.round(Math.min(80, Math.max(35, vw * vh / 16000)));
@@ -272,7 +343,7 @@
   function spawn(n) {
     for (var i = 0; i < n; i++) {
       var it = order[Math.floor(Math.random() * order.length)];
-      bursts.push({ x: it.x, y: it.y, vy: 40 + Math.random() * 80, vx: (Math.random() - .5) * 40, size: 6 + Math.random() * 9,
+      bursts.push({ x: it.x, y: it.y, vy: 40 + Math.random() * 80, vx: (Math.random() - .5) * 40, size: (6 + Math.random() * 9) * Math.max(1, 0.8 / S),
         age: 0, life: 2.8 + Math.random() * 2, ph: Math.random() * 6.28, rot: Math.random() * 6.28, vr: (Math.random() - .5) * 3, c: PCOL[i % PCOL.length] });
     }
   }
